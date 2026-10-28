@@ -209,14 +209,12 @@ async function wikiSearchThumb(q, lang='es', must=''){
 }
 
 /* frascos */
-const P_PENDING = new Set(); let pQueue=Promise.resolve();
+const P_PENDING = new Set(), P_DONE = new Set(); let pQueue=Promise.resolve();
 function fragIdOf(u){ const m=String(u||'').match(/fragrantica\.[a-z.]+\/(?:perfume|perfumes)\/[^"' ]*?-(\d+)\.html/i) || String(u||'').match(/-(\d{3,6})\.html/); return m?m[1]:null; }
 function pSrc(p){
   if(!p) return null;
-  if(p.ownPhoto && p.photo) return {u:p.photo, cat:false};
   if(p.img) return {u:p.img, cat:true};
   const c=IMGC[imgKey(p)]; if(c) return {u:c, cat:true};
-  if(p.photo) return {u:p.photo, cat:false};
   return null;
 }
 const monogram = p => { const w=((p?.brand||p?.name||'?').trim().split(/\s+/).map(x=>x[0]).join('').slice(0,2)||'?').toUpperCase(); return w; };
@@ -225,9 +223,11 @@ function pimg(id, box, opts={}){
   const gray = opts.gray ? 'filter:grayscale(1);opacity:.55;' : '';
   const pad = opts.pad ?? '8%';
   const inner = s ? `<img data-pid="${esc(id)}" src="${esc(s.u)}" alt="" referrerpolicy="no-referrer" style="width:100%;height:100%;display:block;${s.cat?`object-fit:contain;padding:${pad};mix-blend-mode:multiply;`:'object-fit:cover;'}${gray}" onerror="this.style.visibility='hidden'">`
+    : (P_PENDING.has(id) && !P_DONE.has(id)) ? `<span data-pid="${esc(id)}" class="spin" aria-label="Buscando la foto"></span>`
     : `<span data-pid="${esc(id)}" class="mono" style="font-size:${opts.mono||22}px">${esc(monogram(p))}</span>`;
   return `<span class="pbox" data-pbox="${esc(id)}" style="background:${TILE_BG};${box}">${inner}</span>`;
 }
+function paintMono(id){ const p=P(id); document.querySelectorAll(`[data-pbox="${CSS.escape(id)}"] .spin`).forEach(s=>{ s.outerHTML=`<span data-pid="${esc(id)}" class="mono" style="font-size:18px">${esc(monogram(p))}</span>`; }); }
 function paintP(id){
   const p=P(id); const s=pSrc(p); if(!s) return;
   document.querySelectorAll(`[data-pbox="${CSS.escape(id)}"]`).forEach(b=>{
@@ -238,7 +238,7 @@ function paintP(id){
 }
 function resolveP(id){
   if(P_PENDING.has(id)) return; P_PENDING.add(id);
-  pQueue = pQueue.then(()=>findPerfumeImage(id)).catch(()=>{});
+  pQueue = pQueue.then(()=>findPerfumeImage(id)).catch(()=>{}).finally(()=>{ P_DONE.add(id); const p=P(id); if(p){ delete p.scanPhoto; if(S.items[id]) save(); } if(!pSrc(P(id))) paintMono(id); });
 }
 async function findPerfumeImage(id){
   const p=P(id); if(!p || p.img) return;
@@ -255,7 +255,7 @@ async function findPerfumeImage(id){
   if(AI.ready() && (AI.get().provider||'gemini')==='gemini' && !p.imgChecked){
     p.imgChecked=true; if(S.items[id]) save();
     try{
-      const userPhoto = p.photo ? await (await fetch(p.photo)).blob() : null;
+      const userPhoto = p.scanPhoto ? await (await fetch(p.scanPhoto)).blob() : null;
       const r=parseJSON(await aiAsk(`Necesito la foto oficial y correcta del frasco del perfume «${p.name}» de «${p.brand||''}»${p.conc?' ('+p.conc+')':''}.
 1. Busca con Google su página en Fragrantica${p.fragUrl?' (posible URL: '+p.fragUrl+')':''}.
 2. Abre la página y comprueba que es EXACTAMENTE ese perfume (misma marca, nombre y versión/concentración).
@@ -424,8 +424,8 @@ async function identifyPhoto(blob){
     const r=parseJSON(await aiAsk(PROMPT_PHOTO, blob, ctl.signal));
     if(SCAN.ctl!==ctl) return;
     if(r.esPerfume===false || !r.nombre){ SCAN={state:'aino', url, blob}; render(true); return; }
-    const p=stash(fromAI(r)); SCAN={state:'airesult', url, blob, id:p.id}; render(true);
-    if(!S.items[p.id] && !p.photo) toJpeg(blob).then(u=>{ if(u){ p.photo=u; if(TAB==='escanear'&&!layerStack.length) render(true); } });
+    const n=fromAI(r); if(!S.items[n.id]) n.scanPhoto=await toJpeg(blob, 640, .8);
+    const p=stash(n); SCAN={state:'airesult', url, blob, id:p.id}; render(true);
   }catch(e){ if(e.name==='AbortError' || SCAN.ctl!==ctl) return; SCAN={state:'aierror', url, blob, err:aiErrText(e)}; render(true); }
 }
 async function lookupName(q, where){
@@ -672,7 +672,7 @@ function openFicha(id){
     <section class="stack" style="gap:8px"><h2>Más información</h2>
      <a class="btn block" href="https://www.google.com/search?tbm=shop&q=${q}" target="_blank" rel="noopener">${ic('tag',18,1.8)} Comparar precios</a>
      <a class="btn block" href="https://www.fragrantica.es/search/?query=${q}" target="_blank" rel="noopener">${ic('search',18,1.8)} Ver en Fragrantica</a></section>
-    ${saved?`<section class="stack" style="gap:8px"><h2>Foto</h2>${p.ownPhoto&&p.photo?`<button class="btn block" data-act="officialpic" data-id="${id}">Usar la foto oficial del frasco</button>`:''}<div class="row" style="gap:8px"><label for="cam" class="btn grow lbl" data-photo="${id}">${ic('cam',18,1.8)} Hacer foto</label><label for="gal" class="btn grow lbl" data-photo="${id}">${ic('img',18,1.7)} Galería</label></div>
+    ${saved?`<section class="stack" style="gap:8px">${!pSrc(p)&&P_DONE.has(id)?`<button class="btn block" data-act="retryimg" data-id="${id}">Buscar otra vez la foto del perfume</button>`:''}
      <button class="btn block" data-act="remove" data-id="${id}" style="color:var(--warn);margin-top:12px">Borrar de Olfi</button></section>`:''}
    </div></div>`;
   openLayer(html,'sheet',id);
@@ -688,8 +688,9 @@ function drawForm(){
   const f=FORM; const editing=!!f.id;
   const html=`<div class="wrap"><div class="bar-top"><button class="ib" data-close aria-label="Cancelar">${ic('close',22,1.9)}</button><b style="font-weight:600">${editing?'Editar perfume':'Nuevo perfume'}</b><span style="width:44px"></span></div>
    <div class="pad stack form" style="padding-top:8px;gap:8px">
-    <div class="row" style="gap:12px;align-items:flex-start">
-     <div style="width:96px;height:120px;border-radius:16px;overflow:hidden;background:#F4F4F4;display:flex;align-items:center;justify-content:center;flex-shrink:0">${f.photo?`<img src="${esc(f.photo)}" alt="" style="width:100%;height:100%;object-fit:cover">`:`<span class="mono" style="font-size:20px">${ic('cam',26,1.5)}</span>`}</div>
+    ${editing?'':`<span class="xs muted">${f.img?'Foto del catálogo':'La foto solo sirve para leer la etiqueta; en tu colección se mostrará la foto oficial del perfume.'}</span>`}
+    <div class="row" style="gap:12px;align-items:flex-start;${editing?'display:none':''}">
+     <div style="width:96px;height:120px;border-radius:16px;overflow:hidden;background:${TILE_BG};display:flex;align-items:center;justify-content:center;flex-shrink:0">${f.img?`<img src="${esc(f.img)}" alt="" style="width:100%;height:100%;object-fit:contain;padding:8%;mix-blend-mode:multiply">`:f.photo?`<img src="${esc(f.photo)}" alt="" style="width:100%;height:100%;object-fit:cover">`:`<span class="mono" style="font-size:20px">${ic('cam',26,1.5)}</span>`}</div>
      <div class="stack" style="gap:8px;flex:1"><label for="cam" class="btn lbl" data-photo="form" style="height:40px">${ic('cam',18,1.8)} ${f.photo?'Otra foto':'Hacer foto'}</label><label for="gal" class="btn lbl" data-photo="form" style="height:40px">${ic('img',18,1.7)} Galería</label></div>
     </div>
     ${f.ocrState==='loading'?loading('Leyendo el texto de la etiqueta…'):''}
@@ -725,7 +726,7 @@ function saveForm(){
   readForm(); const f=FORM;
   if(!f.name){ toast('Escribe el nombre del perfume'); $('#f_name')?.focus(); return; }
   const id=f.id||newId();
-  const p={...(S.items[id]||{}), id, name:f.name, brand:f.brand, family:f.family||'Amaderado', conc:f.conc, year:Number(f.year)||null, size:f.size, dur:f.dur, estela:f.estela, notes:f.notes, photo:f.photo||null, barcode:f.barcode||P(id)?.barcode||null};
+  const p={...(S.items[id]||{}), id, name:f.name, brand:f.brand, family:f.family||'Amaderado', conc:f.conc, year:Number(f.year)||null, size:f.size, dur:f.dur, estela:f.estela, notes:f.notes, scanPhoto:f.photo||null, photo:null, ...(f.img?{img:f.img}:{}), barcode:f.barcode||P(id)?.barcode||null};
   S.items[id]=p;
   if(!mine(id)) S.coll.push({id, shelf:f.shelf, score:null, level:f.shelf==='tengo'?100:null});
   save(); FORM=null; closeAll();
@@ -817,10 +818,8 @@ async function onBarcode(code){
   }catch(e){}
   if(!prod || !(prod.product_name_es||prod.product_name)){ SCAN={state:'notfound', code}; render(true); FORM_BARCODE=code; return; }
   if(AI.ready()){ SCAN={state:'ai'}; lookupName([(prod.brands||'').split(',')[0], prod.product_name_es||prod.product_name].filter(Boolean).join(' '), 'scan'); return; }
-  let photo=null;
-  if(prod.image_front_url){ try{ const b=await (await fetch(prod.image_front_url)).blob(); photo=await toJpeg(b); }catch(e){} }
   SCAN={state:'idle'};
-  openForm({name:prod.product_name_es||prod.product_name, brand:(prod.brands||'').split(',')[0].trim(), size:prod.quantity||'', barcode:code, photo});
+  openForm({name:prod.product_name_es||prod.product_name, brand:(prod.brands||'').split(',')[0].trim(), size:prod.quantity||'', barcode:code, img:prod.image_front_url||null});
   toast('Encontrado en Open Beauty Facts');
 }
 let FORM_BARCODE=null;
@@ -898,7 +897,7 @@ document.addEventListener('click', e=>{
     case 'retryai': if(SCAN.blob) identifyPhoto(SCAN.blob); break;
     case 'manualfromphoto': { const b=SCAN.blob; SCAN={state:'idle'}; if(b) photoToForm(b); else openForm({}); break; }
     case 'enrich': enrich(d.id); break;
-    case 'officialpic': { const p=S.items[d.id]; p.ownPhoto=false; save(); refreshTop(); break; }
+    case 'retryimg': { const p=S.items[d.id]; delete p.imgChecked; delete p.img; P_PENDING.delete(d.id); P_DONE.delete(d.id); save(); refreshTop(); break; }
     case 'amigos': openAmigos(); break;
     case 'logpick': openPicker(); break;
     case 'new': closeAll(); openForm({barcode:FORM_BARCODE}); FORM_BARCODE=null; break;
@@ -950,7 +949,6 @@ function onFile(e){
   const target=PHOTO_FOR||'scan'; PHOTO_FOR=null;
   if(target==='scan'){ stopCam(); if(AI.ready()) identifyPhoto(f); else photoToForm(f); return; }
   if(target==='form'){ readFormSafe(); toJpeg(f).then(u=>{ if(FORM&&u){ FORM.photo=u; drawForm(); } }); return; }
-  toJpeg(f).then(u=>{ if(u && S.items[target]){ S.items[target].photo=u; S.items[target].ownPhoto=true; save(); toast('Foto guardada'); refreshTop(); } else toast('No se ha podido guardar la foto'); });
 }
 $('#cam').addEventListener('change', onFile); $('#gal').addEventListener('change', onFile);
 $('#imp').addEventListener('change', async e=>{ const f=e.target.files[0]; e.target.value=''; if(!f) return; try{ const s=JSON.parse(await f.text()); if(!s.items||!s.coll) throw 0; s.started=true; S=s; save(); closeAll(); render(); toast('Copia restaurada'); }catch(err){ toast('Ese archivo no es una copia de Olfi'); } });
@@ -974,7 +972,7 @@ function welcome(){
 /* ---------- arranque ---------- */
 (async()=>{
   S = await load();
-  if(S && S.started && S.imgv!==3){ Object.values(S.items||{}).forEach(p=>{ delete p.img; delete p.fragId; delete p.imgUrl; delete p.imgChecked; delete p.fragAsked; }); S.imgv=3; save(); }
+  if(S && S.started && S.imgv!==4){ Object.values(S.items||{}).forEach(p=>{ if(p.photo && !p.img) p.scanPhoto=p.photo; delete p.photo; delete p.ownPhoto; if(S.imgv!==3){ delete p.img; } delete p.fragId; delete p.imgUrl; delete p.imgChecked; delete p.fragAsked; }); S.imgv=4; save(); }
   if(!S || !S.started){ S=empty(); render(); welcome(); } else render();
   if('serviceWorker' in navigator && location.protocol==='https:') navigator.serviceWorker.register('sw.js').catch(()=>{});
 })();
