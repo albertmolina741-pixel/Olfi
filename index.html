@@ -185,17 +185,25 @@ async function toJpeg(src, max=640, q=.82){
 
 /* ---------- imágenes reales: frascos y notas ---------- */
 const TILE_BG = '#F4F2EF';
-const IMGC = (()=>{ try{ return JSON.parse(localStorage.getItem('olfi-imgs')||'{}'); }catch(e){ return {}; } })();
-function imgCacheSet(k,v){ IMGC[k]=v; try{ localStorage.setItem('olfi-imgs', JSON.stringify(IMGC)); }catch(e){} }
+const IMGC = (()=>{ try{ return JSON.parse(localStorage.getItem('olfi-imgs3')||'{}'); }catch(e){ return {}; } })();
+function imgCacheSet(k,v){ IMGC[k]=v; try{ localStorage.setItem('olfi-imgs3', JSON.stringify(IMGC)); }catch(e){} }
 const imgKey = p => 'p:'+norm((p.brand||'')+' '+p.name);
 function loadOK(u, ms=8000){ return new Promise(res=>{ if(!u) return res(false); const i=new Image(); const t=setTimeout(()=>{ i.src=''; res(false); }, ms); i.onload=()=>{ clearTimeout(t); res(i.naturalWidth>40); }; i.onerror=()=>{ clearTimeout(t); res(false); }; i.referrerPolicy='no-referrer'; i.src=u; }); }
 async function getJSON(u){ const r=await fetch(u); if(!r.ok) throw 0; return r.json(); }
 async function wikiThumb(title, lang='es'){
   try{ const j=await getJSON(`https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title.replace(/ /g,'_'))}`);
-    if(j.type==='disambiguation') return null; const t=j.thumbnail?.source || j.originalimage?.source; return t ? t.replace(/\/\d+px-/, '/400px-') : null; }catch(e){ return null; }
+    if(j.type==='disambiguation') return null; return j.thumbnail?.source || j.originalimage?.source || null; }catch(e){ return null; }
+}
+async function wikiPerfumeThumb(title, lang, name){
+  try{ const j=await getJSON(`https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title.replace(/ /g,'_'))}`);
+    if(j.type!=='standard') return null;
+    const txt=((j.description||'')+' '+(j.extract||'')).toLowerCase();
+    if(!/perfume|fragrance|fragancia|eau de|parfum/.test(txt)) return null;
+    if(!norm(j.title).includes(norm(name).split(' ')[0])) return null;
+    return j.thumbnail?.source || null; }catch(e){ return null; }
 }
 async function wikiSearchThumb(q, lang='es', must=''){
-  try{ const j=await getJSON(`https://${lang}.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(q)}&gsrlimit=3&prop=pageimages&piprop=thumbnail&pithumbsize=400&format=json&origin=*`);
+  try{ const j=await getJSON(`https://${lang}.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(q)}&gsrlimit=3&prop=pageimages&piprop=thumbnail&pithumbsize=330&format=json&origin=*`);
     const pages=Object.values(j.query?.pages||{}).sort((a,b)=>a.index-b.index);
     const hit=pages.find(p=>p.thumbnail && (!must || norm(p.title).includes(must))); return hit?.thumbnail.source || null; }catch(e){ return null; }
 }
@@ -235,28 +243,35 @@ function resolveP(id){
 async function findPerfumeImage(id){
   const p=P(id); if(!p || p.img) return;
   const key=imgKey(p); if(IMGC[key]){ p.img=IMGC[key]; if(S.items[id]) save(); paintP(id); return; }
-  const tries=[];
-  const fid = p.fragId || fragIdOf(p.fragUrl);
-  if(fid) tries.push(`https://fimgs.net/mdimg/perfume-thumbs/375x500.${fid}.jpg`, `https://fimgs.net/mdimg/perfume/375x500.${fid}.jpg`);
-  if(p.imgUrl) tries.push(p.imgUrl);
-  for(const u of tries){ if(await loadOK(u)) return done(u); }
-  // Open Beauty Facts (fotos con licencia libre)
+  const done=u=>{ p.img=u; imgCacheSet(key,u); if(S.items[id]) save(); paintP(id); };
+  // 1) Open Beauty Facts: solo si nombre y marca coinciden
   try{
-    const j=await getJSON(`https://world.openbeautyfacts.org/cgi/search.pl?search_terms=${encodeURIComponent((p.brand||'')+' '+p.name)}&search_simple=1&json=1&page_size=8&fields=product_name,brands,image_front_url`);
-    const w=norm(p.name).split(' ').filter(x=>x.length>2);
-    const hit=(j.products||[]).find(x=>x.image_front_url && w.every(t=>norm(x.product_name).includes(t)) && (!p.brand || norm(x.brands).includes(norm(p.brand).split(' ')[0])));
+    const j=await getJSON(`https://world.openbeautyfacts.org/cgi/search.pl?search_terms=${encodeURIComponent((p.brand||'')+' '+p.name)}&search_simple=1&json=1&page_size=10&fields=product_name,brands,image_front_url`);
+    const w=norm(p.name).split(' ').filter(x=>x.length>2 && !['eau','de','parfum','toilette','edp','edt'].includes(x));
+    const hit=(j.products||[]).find(x=>x.image_front_url && w.length && w.every(t=>norm(x.product_name).includes(t)) && p.brand && norm(x.brands).includes(norm(p.brand).split(' ')[0]));
     if(hit && await loadOK(hit.image_front_url)) return done(hit.image_front_url);
   }catch(e){}
-  // Wikipedia (perfumes clásicos)
-  for(const [t,l] of [[(p.brand?p.brand+' ':'')+p.name,'es'],[(p.brand?p.brand+' ':'')+p.name,'en'],[p.name,'en']]){ const u=await wikiThumb(t,l); if(u && await loadOK(u)) return done(u); }
-  // Pregunta a la IA por la ficha de Fragrantica (solo una vez por perfume)
-  if(AI.ready() && !p.fragAsked){
-    p.fragAsked=true;
-    try{ const r=parseJSON(await aiAsk(`Busca en Google la página de Fragrantica del perfume «${p.name}» de «${p.brand||''}». Responde solo JSON: {"fragrantica":"URL exacta de la página en fragrantica.com o .es, o vacío si no la encuentras"}`, null));
-      const id2=fragIdOf(r.fragrantica); if(id2){ p.fragId=id2; p.fragUrl=r.fragrantica; for(const u of [`https://fimgs.net/mdimg/perfume-thumbs/375x500.${id2}.jpg`,`https://fimgs.net/mdimg/perfume/375x500.${id2}.jpg`]) if(await loadOK(u)) return done(u); } }catch(e){}
-    if(S.items[id]) save();
+  // 2) Fragrantica, verificado por la IA (abre la página y la imagen)
+  if(AI.ready() && (AI.get().provider||'gemini')==='gemini' && !p.imgChecked){
+    p.imgChecked=true; if(S.items[id]) save();
+    try{
+      const userPhoto = p.photo ? await (await fetch(p.photo)).blob() : null;
+      const r=parseJSON(await aiAsk(`Necesito la foto oficial y correcta del frasco del perfume «${p.name}» de «${p.brand||''}»${p.conc?' ('+p.conc+')':''}.
+1. Busca con Google su página en Fragrantica${p.fragUrl?' (posible URL: '+p.fragUrl+')':''}.
+2. Abre la página y comprueba que es EXACTAMENTE ese perfume (misma marca, nombre y versión/concentración).
+3. Copia de la página la URL de la imagen principal del frasco (suele ser https://fimgs.net/mdimg/perfume/375x500.NUMERO.jpg o la de og:image). No la construyas tú: cópiala de la página.
+4. Abre esa imagen y confirma que muestra ese frasco.${userPhoto?' Compárala con la foto adjunta, hecha por el usuario: debe ser el mismo frasco (forma, tapón, color).':''}
+Responde solo JSON: {"fragrantica":"URL de la página","imagen":"URL de la imagen","verificado":true o false}`, userPhoto, null, {tools:'web'}));
+      const urls=[];
+      if(r.verificado===true){
+        if(/^https?:\/\//.test(r.imagen||'')) urls.push(r.imagen);
+        const fid=fragIdOf(r.fragrantica); if(fid){ p.fragUrl=r.fragrantica; urls.push(`https://fimgs.net/mdimg/perfume/375x500.${fid}.jpg`,`https://fimgs.net/mdimg/perfume-thumbs/375x500.${fid}.jpg`); }
+      }
+      for(const u of urls) if(await loadOK(u)) return done(u);
+    }catch(e){}
   }
-  function done(u){ p.img=u; imgCacheSet(key,u); if(S.items[id]) save(); paintP(id); }
+  // 3) Wikipedia, solo si el artículo es del propio perfume
+  for(const [t,l] of [[(p.brand?p.brand+' ':'')+p.name,'en'],[p.name,'en'],[(p.brand?p.brand+' ':'')+p.name,'es']]){ const u=await wikiPerfumeThumb(t,l,p.name); if(u && await loadOK(u)) return done(u); }
 }
 
 /* notas */
@@ -306,14 +321,14 @@ async function shrinkForAI(src){
   return await new Promise(r=>c.toBlob(r,'image/jpeg',.85));
 }
 
-async function geminiCall(key, prompt, b64, signal){
+async function geminiCall(key, prompt, b64, signal, opts={}){
   const cfg=AI.get()||{}; let models = cfg.model ? [cfg.model, ...GEMINI_MODELS.filter(m=>m!==cfg.model)] : GEMINI_MODELS;
   let lastErr=null;
   for(const m of models){
-    for(const withSearch of [true,false]){
+    for(const withSearch of (opts.tools==='web'?['web','search',false]:['search',false])){
       const parts=[{text:prompt}]; if(b64) parts.push({inline_data:{mime_type:'image/jpeg', data:b64}});
       const body={contents:[{role:'user',parts}], generationConfig:{temperature:0.2}};
-      if(withSearch) body.tools=[{google_search:{}}];
+      if(withSearch==='web') body.tools=[{google_search:{}},{url_context:{}}]; else if(withSearch) body.tools=[{google_search:{}}];
       let r;
       try{ r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${encodeURIComponent(key)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal}); }
       catch(e){ if(e.name==='AbortError') throw e; throw new AIError('network','No hay conexión a internet.'); }
@@ -351,17 +366,17 @@ async function claudeCall(key, prompt, b64, signal){
   }
   throw lastErr || new AIError('server','No se ha podido contactar con la IA.');
 }
-async function aiAsk(prompt, image, signal){
+async function aiAsk(prompt, image, signal, opts={}){
   const c=AI.get(); if(!c?.key) throw new AIError('nokey','Falta la clave de la IA.');
   const b64 = image ? await blobToB64(await shrinkForAI(image)) : null;
-  return (c.provider==='claude' ? claudeCall : geminiCall)(c.key, prompt, b64, signal);
+  return (c.provider==='claude' ? claudeCall : geminiCall)(c.key, prompt, b64, signal, opts);
 }
 function parseJSON(txt){
   let t=String(txt||'').replace(/```(?:json)?/gi,'');
   const a=t.indexOf('{'), b=t.lastIndexOf('}'); if(a<0||b<a) throw new AIError('parse','Respuesta no válida');
   return JSON.parse(t.slice(a,b+1));
 }
-const INFO_SCHEMA = `{"nombre":"","marca":"","concentracion":"","anio":null,"perfumista":"","genero":"Masculino|Femenino|Unisex","familia":"","salida":[],"corazon":[],"fondo":[],"acordes":[["",0]],"duracion":"","estela":"","estaciones":[],"ocasiones":[],"descripcion":"","similares":[{"marca":"","nombre":""}],"alternativas":[{"marca":"","nombre":""}],"fragrantica":"","imagen":""}`;
+const INFO_SCHEMA = `{"nombre":"","marca":"","concentracion":"","anio":null,"perfumista":"","genero":"Masculino|Femenino|Unisex","familia":"","salida":[],"corazon":[],"fondo":[],"acordes":[["",0]],"duracion":"","estela":"","estaciones":[],"ocasiones":[],"descripcion":"","similares":[{"marca":"","nombre":""}],"alternativas":[{"marca":"","nombre":""}],"fragrantica":""}`;
 const INFO_RULES = `Busca en Google (Fragrantica, Parfumo, la web de la marca) para confirmar el perfume y sus datos. Usa solo datos reales; si no encuentras un dato, déjalo vacío o null, no lo inventes.
 - "familia": una de ${FAMILIES.join(', ')}.
 - Notas en español, con mayúscula inicial, máximo 5 por nivel. Si el perfume no tiene pirámide, pon todas las notas en "corazon".
@@ -369,8 +384,7 @@ const INFO_RULES = `Busca en Google (Fragrantica, Parfumo, la web de la marca) p
 - "duracion" como "6–8 h"; "estela": Suave, Moderada o Intensa.
 - "estaciones": de Primavera, Verano, Otoño, Invierno. "ocasiones": de Día, Noche, Oficina, Cita, Fiesta, Deporte.
 - "descripcion": 2 frases en español describiendo cómo huele.
-- "fragrantica": URL exacta de la página de este perfume en fragrantica.com o fragrantica.es (búscala).
-- "imagen": URL directa (.jpg/.png/.webp) de una foto oficial del frasco sobre fondo blanco, si la encuentras; si no, vacío.
+- "fragrantica": URL de la página de este perfume en Fragrantica, solo si la has visto en los resultados de búsqueda; si no, vacío.
 - "similares": 3 perfumes parecidos. "alternativas": otros perfumes que podrían ser (otras versiones o flankers) si no estás seguro.
 Responde SOLO con el JSON, sin texto antes ni después.`;
 const PROMPT_PHOTO = `Eres experto en perfumería. La imagen es una foto hecha con el móvil de un frasco o una caja de perfume.
@@ -392,12 +406,12 @@ function fromAI(r){
     family:fam, notes:[arr(r.salida),arr(r.corazon),arr(r.fondo)],
     acc:(Array.isArray(r.acordes)?r.acordes:[]).filter(a=>Array.isArray(a)&&a[0]).slice(0,6).map(a=>[String(a[0]),Math.max(10,Math.min(100,Number(a[1])||50))]),
     dur:r.duracion||'', estela:['Suave','Moderada','Intensa'].includes(r.estela)?r.estela:'', seasons:arr(r.estaciones,4), occasions:arr(r.ocasiones,6), desc:r.descripcion||'',
-    similar:pairs(r.similares), alts:pairs(r.alternativas), conf:r.confianza||'', source:'ia', fragUrl:r.fragrantica||'', fragId:fragIdOf(r.fragrantica), imgUrl:/^https?:\/\//.test(r.imagen||'')?r.imagen:''};
+    similar:pairs(r.similares), alts:pairs(r.alternativas), conf:r.confianza||'', source:'ia', fragUrl:r.fragrantica||''};
   const ex = Object.values(S.items).find(x=>norm(x.name)===norm(p.name) && norm(x.brand)===norm(p.brand));
   p.id = ex ? ex.id : 't'+norm(p.brand+' '+p.name).replace(/ /g,'-').slice(0,60);
   return p;
 }
-function stash(p){ if(S.items[p.id]){ const keep=S.items[p.id]; for(const k of ['acc','perfumer','gender','seasons','occasions','desc','similar','dur','estela','year','conc','fragUrl','fragId','imgUrl']) if(!keep[k] || (Array.isArray(keep[k])&&!keep[k].length)) keep[k]=p[k]; if(!keep.notes.flat().length) keep.notes=p.notes; save(); return keep; } TEMP[p.id]=p; return p; }
+function stash(p){ if(S.items[p.id]){ const keep=S.items[p.id]; for(const k of ['acc','perfumer','gender','seasons','occasions','desc','similar','dur','estela','year','conc','fragUrl']) if(!keep[k] || (Array.isArray(keep[k])&&!keep[k].length)) keep[k]=p[k]; if(!keep.notes.flat().length) keep.notes=p.notes; save(); return keep; } TEMP[p.id]=p; return p; }
 function ensureItem(id){ if(!S.items[id] && TEMP[id]){ S.items[id]=TEMP[id]; delete TEMP[id]; } }
 const aiErrText = e => e?.code==='nokey' ? 'Activa el reconocimiento con IA en Ajustes.' : (e?.message||'No se ha podido identificar.');
 
@@ -920,7 +934,7 @@ document.addEventListener('submit', e=>{ if(e.target.id==='aform'){ e.preventDef
 async function enrich(id){
   const p=S.items[id]; if(!p) return; toast('Buscando información…');
   try{ const r=parseJSON(await aiAsk(promptName((p.brand?p.brand+' ':'')+p.name), null)); const n=fromAI(r); if(!n) throw new AIError('none','No se ha encontrado información.');
-    for(const k of ['acc','perfumer','gender','seasons','occasions','desc','similar','dur','estela','year','conc','family','fragUrl','fragId','imgUrl']) if(n[k] && (!Array.isArray(n[k])||n[k].length)) p[k]=n[k];
+    for(const k of ['acc','perfumer','gender','seasons','occasions','desc','similar','dur','estela','year','conc','family','fragUrl']) if(n[k] && (!Array.isArray(n[k])||n[k].length)) p[k]=n[k];
     if(n.notes.flat().length) p.notes=n.notes; p.source='ia'; save(); if(!p.img) resolveP(id); toast('Información completada'); if(layerStack[layerStack.length-1]?.dataset.key===id) refreshTop();
   }catch(e){ toast(aiErrText(e)); }
 }
@@ -960,6 +974,7 @@ function welcome(){
 /* ---------- arranque ---------- */
 (async()=>{
   S = await load();
+  if(S && S.started && S.imgv!==3){ Object.values(S.items||{}).forEach(p=>{ delete p.img; delete p.fragId; delete p.imgUrl; delete p.imgChecked; delete p.fragAsked; }); S.imgv=3; save(); }
   if(!S || !S.started){ S=empty(); render(); welcome(); } else render();
   if('serviceWorker' in navigator && location.protocol==='https:') navigator.serviceWorker.register('sw.js').catch(()=>{});
 })();
