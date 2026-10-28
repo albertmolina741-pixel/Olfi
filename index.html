@@ -137,7 +137,7 @@ const norm=s=>String(s||'').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,''
 const newId = () => 'p'+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
 const famColor = f => FAMCOL[f] || '#6B6B6B';
 let S = null;
-const P = id => S && S.items[id];
+const P = id => (S && S.items[id]) || TEMP[id];
 const mine = id => S.coll.find(c=>c.id===id);
 const splitNotes = s => String(s||'').split(/[,;\n]/).map(x=>x.trim()).filter(Boolean).slice(0,6).map(x=>x[0].toUpperCase()+x.slice(1));
 
@@ -191,6 +191,184 @@ async function toJpeg(src, max=640, q=.82){
   c.getContext('2d').drawImage(bmp,0,0,c.width,c.height); return c.toDataURL('image/jpeg', q);
 }
 
+/* ---------- IA: reconocimiento por foto y búsqueda por nombre ---------- */
+const TEMP = {};
+const AI = {
+  get(){ try{ return JSON.parse(localStorage.getItem('olfi-ai')||'null'); }catch(e){ return null; } },
+  set(c){ try{ localStorage.setItem('olfi-ai', JSON.stringify(c)); }catch(e){} },
+  ready(){ const c=AI.get(); return !!(c && c.key); }
+};
+const GEMINI_MODELS = ['gemini-flash-latest','gemini-3.8-flash','gemini-3.6-flash','gemini-3-flash-preview','gemini-2.5-flash','gemini-flash-lite-latest'];
+const CLAUDE_MODELS = ['claude-sonnet-5-5','claude-haiku-5-5','claude-sonnet-4-5'];
+class AIError extends Error { constructor(code, msg){ super(msg); this.code=code; } }
+
+async function blobToB64(blob){ return await new Promise((res,rej)=>{ const fr=new FileReader(); fr.onload=()=>res(String(fr.result).split(',')[1]); fr.onerror=rej; fr.readAsDataURL(blob); }); }
+async function shrinkForAI(src){
+  const bmp=await createImageBitmap(src); const k=Math.min(1, 1280/Math.max(bmp.width,bmp.height));
+  const c=document.createElement('canvas'); c.width=Math.round(bmp.width*k); c.height=Math.round(bmp.height*k); c.getContext('2d').drawImage(bmp,0,0,c.width,c.height);
+  return await new Promise(r=>c.toBlob(r,'image/jpeg',.85));
+}
+
+async function geminiCall(key, prompt, b64, signal){
+  const cfg=AI.get()||{}; let models = cfg.model ? [cfg.model, ...GEMINI_MODELS.filter(m=>m!==cfg.model)] : GEMINI_MODELS;
+  let lastErr=null;
+  for(const m of models){
+    for(const withSearch of [true,false]){
+      const parts=[{text:prompt}]; if(b64) parts.push({inline_data:{mime_type:'image/jpeg', data:b64}});
+      const body={contents:[{role:'user',parts}], generationConfig:{temperature:0.2}};
+      if(withSearch) body.tools=[{google_search:{}}];
+      let r;
+      try{ r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${encodeURIComponent(key)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal}); }
+      catch(e){ if(e.name==='AbortError') throw e; throw new AIError('network','No hay conexión a internet.'); }
+      if(r.ok){
+        const j=await r.json(); const txt=(j.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('');
+        if(txt.trim()){ if(cfg.model!==m) AI.set({...cfg, model:m}); return txt; }
+        lastErr=new AIError('empty','La IA no ha devuelto respuesta.'); continue;
+      }
+      const e=await r.json().catch(()=>({})); const msg=(e.error?.message||'')+''; const st=e.error?.status||'';
+      if(r.status===400 && /API key|API_KEY/i.test(msg)) throw new AIError('key','La clave no es válida. Revísala en Ajustes.');
+      if(r.status===401 || r.status===403) throw new AIError('key','La clave no es válida o no tiene permiso. Revísala en Ajustes.');
+      if(r.status===404){ lastErr=new AIError('model','Modelo no disponible'); break; } // siguiente modelo
+      if(r.status===429){ lastErr=new AIError('quota','Has llegado al límite gratuito de hoy. Vuelve a intentarlo más tarde.'); if(withSearch) continue; break; }
+      if(r.status===400 && withSearch){ lastErr=new AIError('bad',msg); continue; } // prueba sin búsqueda
+      lastErr=new AIError('server', msg||('Error '+r.status)); if(r.status>=500) break; else break;
+    }
+  }
+  throw lastErr || new AIError('server','No se ha podido contactar con la IA.');
+}
+async function claudeCall(key, prompt, b64, signal){
+  const cfg=AI.get()||{}; let models = cfg.model && cfg.model.startsWith('claude') ? [cfg.model, ...CLAUDE_MODELS.filter(m=>m!==cfg.model)] : CLAUDE_MODELS;
+  let lastErr=null;
+  for(const m of models){
+    const content=[]; if(b64) content.push({type:'image',source:{type:'base64',media_type:'image/jpeg',data:b64}}); content.push({type:'text',text:prompt});
+    let r;
+    try{ r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',signal,headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify({model:m,max_tokens:2500,messages:[{role:'user',content}]})}); }
+    catch(e){ if(e.name==='AbortError') throw e; throw new AIError('network','No hay conexión a internet.'); }
+    if(r.ok){ const j=await r.json(); const txt=(j.content||[]).map(c=>c.text||'').join(''); if(cfg.model!==m) AI.set({...cfg, model:m}); return txt; }
+    const e=await r.json().catch(()=>({})); const msg=e.error?.message||'';
+    if(r.status===401||r.status===403) throw new AIError('key','La clave no es válida. Revísala en Ajustes.');
+    if(r.status===404){ lastErr=new AIError('model','Modelo no disponible'); continue; }
+    if(r.status===429) throw new AIError('quota','Demasiadas consultas seguidas. Espera un minuto.');
+    if(r.status===400 && /credit|balance/i.test(msg)) throw new AIError('quota','Tu cuenta de Anthropic no tiene saldo.');
+    throw new AIError('server', msg||('Error '+r.status));
+  }
+  throw lastErr || new AIError('server','No se ha podido contactar con la IA.');
+}
+async function aiAsk(prompt, image, signal){
+  const c=AI.get(); if(!c?.key) throw new AIError('nokey','Falta la clave de la IA.');
+  const b64 = image ? await blobToB64(await shrinkForAI(image)) : null;
+  return (c.provider==='claude' ? claudeCall : geminiCall)(c.key, prompt, b64, signal);
+}
+function parseJSON(txt){
+  let t=String(txt||'').replace(/```(?:json)?/gi,'');
+  const a=t.indexOf('{'), b=t.lastIndexOf('}'); if(a<0||b<a) throw new AIError('parse','Respuesta no válida');
+  return JSON.parse(t.slice(a,b+1));
+}
+const INFO_SCHEMA = `{"nombre":"","marca":"","concentracion":"","anio":null,"perfumista":"","genero":"Masculino|Femenino|Unisex","familia":"","salida":[],"corazon":[],"fondo":[],"acordes":[["",0]],"duracion":"","estela":"","estaciones":[],"ocasiones":[],"descripcion":"","similares":[{"marca":"","nombre":""}],"alternativas":[{"marca":"","nombre":""}]}`;
+const INFO_RULES = `Busca en Google (Fragrantica, Parfumo, la web de la marca) para confirmar el perfume y sus datos. Usa solo datos reales; si no encuentras un dato, déjalo vacío o null, no lo inventes.
+- "familia": una de ${FAMILIES.join(', ')}.
+- Notas en español, con mayúscula inicial, máximo 5 por nivel. Si el perfume no tiene pirámide, pon todas las notas en "corazon".
+- "acordes": hasta 6 acordes principales en español con su intensidad de 0 a 100.
+- "duracion" como "6–8 h"; "estela": Suave, Moderada o Intensa.
+- "estaciones": de Primavera, Verano, Otoño, Invierno. "ocasiones": de Día, Noche, Oficina, Cita, Fiesta, Deporte.
+- "descripcion": 2 frases en español describiendo cómo huele.
+- "similares": 3 perfumes parecidos. "alternativas": otros perfumes que podrían ser (otras versiones o flankers) si no estás seguro.
+Responde SOLO con el JSON, sin texto antes ni después.`;
+const PROMPT_PHOTO = `Eres experto en perfumería. La imagen es una foto hecha con el móvil de un frasco o una caja de perfume.
+Identifica el perfume EXACTO: marca, nombre y versión (distingue flankers y concentraciones, p. ej. "Sauvage Eau de Toilette", "Sauvage Eau de Parfum" o "Sauvage Elixir"). Fíjate en la forma del frasco, el tapón, el color del líquido, el logotipo y todo el texto visible.
+${INFO_RULES}
+Formato: {"esPerfume":true,"confianza":"alta|media|baja", ...los campos de ${INFO_SCHEMA}}
+Si en la foto no hay ningún perfume: {"esPerfume":false}`;
+const promptName = q => `Eres experto en perfumería. El usuario busca este perfume: «${q}». Identifica el perfume real que más probablemente quiere decir (marca, nombre y versión exacta).
+${INFO_RULES}
+Formato: {"encontrado":true,"confianza":"alta|media|baja", ...los campos de ${INFO_SCHEMA}}
+Si no existe ningún perfume parecido: {"encontrado":false}`;
+
+function fromAI(r){
+  if(!r || !r.nombre) return null;
+  const fam = FAMCOL[r.familia] ? r.familia : (FAMILIES.find(f=>norm(f)===norm(r.familia)) || 'Amaderado');
+  const arr = (a,n=5) => (Array.isArray(a)?a:[]).filter(x=>typeof x==='string'&&x.trim()).slice(0,n).map(x=>x.trim());
+  const pairs = a => (Array.isArray(a)?a:[]).map(x=>typeof x==='string'?{nombre:x,marca:''}:x).filter(x=>x&&x.nombre).slice(0,4).map(x=>({name:String(x.nombre), brand:String(x.marca||'')}));
+  const p = {name:String(r.nombre).trim(), brand:String(r.marca||'').trim(), conc:r.concentracion||'', year:Number(r.anio)||null, perfumer:r.perfumista||'', gender:r.genero&&!/\|/.test(r.genero)?r.genero:'',
+    family:fam, notes:[arr(r.salida),arr(r.corazon),arr(r.fondo)],
+    acc:(Array.isArray(r.acordes)?r.acordes:[]).filter(a=>Array.isArray(a)&&a[0]).slice(0,6).map(a=>[String(a[0]),Math.max(10,Math.min(100,Number(a[1])||50))]),
+    dur:r.duracion||'', estela:['Suave','Moderada','Intensa'].includes(r.estela)?r.estela:'', seasons:arr(r.estaciones,4), occasions:arr(r.ocasiones,6), desc:r.descripcion||'',
+    similar:pairs(r.similares), alts:pairs(r.alternativas), conf:r.confianza||'', source:'ia'};
+  const ex = Object.values(S.items).find(x=>norm(x.name)===norm(p.name) && norm(x.brand)===norm(p.brand));
+  p.id = ex ? ex.id : 't'+norm(p.brand+' '+p.name).replace(/ /g,'-').slice(0,60);
+  return p;
+}
+function stash(p){ if(S.items[p.id]){ const keep=S.items[p.id]; for(const k of ['acc','perfumer','gender','seasons','occasions','desc','similar','dur','estela','year','conc']) if(!keep[k] || (Array.isArray(keep[k])&&!keep[k].length)) keep[k]=p[k]; if(!keep.notes.flat().length) keep.notes=p.notes; save(); return keep; } TEMP[p.id]=p; return p; }
+function ensureItem(id){ if(!S.items[id] && TEMP[id]){ S.items[id]=TEMP[id]; delete TEMP[id]; } }
+const aiErrText = e => e?.code==='nokey' ? 'Activa el reconocimiento con IA en Ajustes.' : (e?.message||'No se ha podido identificar.');
+
+async function identifyPhoto(blob){
+  stopCam();
+  const url=URL.createObjectURL(blob);
+  const ctl=new AbortController();
+  SCAN={state:'ai', url, blob, ctl}; render(true);
+  try{
+    const r=parseJSON(await aiAsk(PROMPT_PHOTO, blob, ctl.signal));
+    if(SCAN.ctl!==ctl) return;
+    if(r.esPerfume===false || !r.nombre){ SCAN={state:'aino', url, blob}; render(true); return; }
+    const p=stash(fromAI(r)); SCAN={state:'airesult', url, blob, id:p.id}; render(true);
+    if(!S.items[p.id] && !p.photo) toJpeg(blob).then(u=>{ if(u){ p.photo=u; if(TAB==='escanear'&&!layerStack.length) render(true); } });
+  }catch(e){ if(e.name==='AbortError' || SCAN.ctl!==ctl) return; SCAN={state:'aierror', url, blob, err:aiErrText(e)}; render(true); }
+}
+async function lookupName(q, where){
+  const ctl=new AbortController(); LOOK={state:'loading', q, ctl, where}; drawLook();
+  try{
+    const r=parseJSON(await aiAsk(promptName(q), null, ctl.signal));
+    if(LOOK.ctl!==ctl) return;
+    if(r.encontrado===false || !r.nombre){ LOOK={state:'none', q, where}; drawLook(); return; }
+    const p=stash(fromAI(r)); LOOK={state:'done', q, id:p.id, where}; drawLook();
+  }catch(e){ if(e.name==='AbortError' || LOOK.ctl!==ctl) return; LOOK={state:'error', q, err:aiErrText(e), where}; drawLook(); }
+}
+let LOOK={state:'idle'};
+function drawLook(){
+  if(LOOK.where==='scan' && TAB==='escanear' && !layerStack.length){ if(LOOK.state==='done'){ SCAN={...SCAN, state:'airesult', id:LOOK.id}; } else if(LOOK.state==='loading'){ SCAN={...SCAN, state:'ai'}; } else if(LOOK.state==='error'){ SCAN={...SCAN, state:'aierror', err:LOOK.err}; } render(true); return; }
+  if(TAB==='descubrir' && !layerStack.length) render(true);
+}
+
+function resultCard(id, how){
+  const p=P(id); const c=mine(id);
+  return `<div class="card stack" style="gap:12px;border-radius:22px">
+   <div class="row" style="align-items:flex-start">${tile(id,'width:64px;height:78px;border-radius:14px;flex-shrink:0')}<span class="grow" style="line-height:1.3;min-width:0"><span class="xs" style="color:${p.conf==='baja'?'var(--warn)':'var(--good)'};font-weight:600">${how}${p.conf&&p.conf!=='alta'?' · confianza '+esc(p.conf):''}</span><b style="font-size:18px;font-weight:600;display:block">${esc(p.name)}</b><span class="sm muted">${[p.brand,p.conc,p.year].filter(Boolean).map(esc).join(' · ')}</span></span></div>
+   ${p.desc?`<p class="sm" style="margin:0">${esc(p.desc)}</p>`:''}
+   ${p.notes.flat().length?`<div class="row" style="flex-wrap:wrap;gap:6px">${p.notes.flat().slice(0,6).map(n=>`<span class="chip">${noteImg(n,24)}${esc(n)}</span>`).join('')}</div>`:''}
+   <div class="row" style="gap:8px">${c?`<button class="btn primary grow" data-open="${id}">${ic('check',18,2.2)} Ya está en tu colección</button>`:`<button class="btn primary grow" data-act="keep" data-id="${id}" data-to="tengo">La tengo</button><button class="btn grow" data-act="keep" data-id="${id}" data-to="deseo">La quiero</button>`}</div>
+   <button class="btn block" data-open="${id}">Ver toda la información</button>
+   ${p.alts&&p.alts.length?`<div class="stack" style="gap:6px"><span class="xs muted">¿No es este? Puede ser:</span><div class="row" style="flex-wrap:wrap;gap:6px">${p.alts.map(a=>`<button class="pill" data-alt="${esc((a.brand?a.brand+' ':'')+a.name)}">${esc((a.brand?a.brand+' ':'')+a.name)}</button>`).join('')}</div></div>`:''}
+  </div>`;
+}
+const setupCard = (compact) => `<div class="card stack" style="border-radius:22px;border-color:var(--neroli);gap:10px">
+  <b style="font-weight:600;font-size:16px">Activa el reconocimiento de perfumes</b>
+  <span class="sm muted">${compact?'Para identificar perfumes con la foto, conecta la IA de Google. Es gratis y tarda 2 minutos.':'Olfi usa la IA de Google (Gemini) para reconocer el perfume en la foto y traer toda su información. Es gratis: solo necesitas una clave.'}</span>
+  <button class="btn primary block" data-act="aisetup">Configurar ahora</button></div>`;
+
+function openAISetup(){
+  const c=AI.get()||{provider:'gemini',key:''};
+  openLayer(`<div class="wrap"><div class="bar-top"><button class="ib" data-close aria-label="Volver">${ic('back',24,1.9)}</button><b style="font-weight:600">Reconocimiento con IA</b><span style="width:44px"></span></div>
+  <div class="pad stack" style="padding-top:8px;gap:14px">
+   <div class="seg" role="group" aria-label="Proveedor"><button data-prov="gemini" aria-pressed="${c.provider!=='claude'}">Google Gemini · gratis</button><button data-prov="claude" aria-pressed="${c.provider==='claude'}">Claude · de pago</button></div>
+   <div id="provhelp">${provHelp(c.provider||'gemini')}</div>
+   <label class="sm" for="aikey"><b style="font-weight:600">Pega aquí tu clave</b></label>
+   <input id="aikey" class="field" style="padding:0 14px;font-family:monospace" value="${esc(c.key||'')}" placeholder="${c.provider==='claude'?'sk-ant-…':'AIza…'}" autocomplete="off" autocapitalize="off" spellcheck="false">
+   <button class="btn primary block" data-act="aisave">Guardar y probar</button>
+   <div id="aitest" role="status" aria-live="polite"></div>
+   <p class="xs muted" style="margin:0">La clave se guarda solo en este móvil y no se incluye en las copias de seguridad. Las fotos se envían a ${c.provider==='claude'?'Anthropic':'Google'} para identificarlas.</p>
+   ${c.key?'<button class="btn block" data-act="aidel" style="color:var(--warn)">Quitar la clave</button>':''}
+  </div></div>`,'sheet','aisetup');
+}
+const provHelp = p => p==='claude'
+ ? `<ol class="sm" style="margin:0;padding-left:20px;line-height:1.6"><li>Entra en <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a> y crea una cuenta.</li><li>Añade saldo (Billing). Cada foto cuesta alrededor de 1–2 céntimos.</li><li>En «API keys», pulsa «Create key» y copia la clave.</li></ol>`
+ : `<ol class="sm" style="margin:0;padding-left:20px;line-height:1.6"><li>Abre <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a> e inicia sesión con tu cuenta de Google.</li><li>Acepta las condiciones si te las pide.</li><li>Pulsa «Create API key» (Crear clave de API) y cópiala.</li><li>Vuelve a Olfi y pégala abajo.</li></ol><p class="xs muted" style="margin:6px 0 0">El plan gratuito tiene un límite de consultas al día, de sobra para uso personal.</p>`;
+async function testAI(){
+  const box=$('#aitest'); box.innerHTML=loading('Comprobando la clave…');
+  try{ const r=parseJSON(await aiAsk('Responde solo con este JSON: {"ok":true}', null)); box.innerHTML = r.ok ? notice('Todo listo.','Ya puedes escanear perfumes.') : notice('Respuesta inesperada.','Prueba a escanear igualmente.'); }
+  catch(e){ box.innerHTML=notice('No funciona todavía.', esc(aiErrText(e))); }
+}
+
 /* ---------- navegación ---------- */
 let TAB='inicio', SHELF='tengo', Q='', FAMF=null, SCAN={state:'idle'}, PHOTO_FOR=null, installEvt=null;
 const TABS=[['inicio','Inicio','home'],['descubrir','Buscar','search'],['escanear','Escanear','scan'],['diario','Resumen semanal','cal'],['perfil','Perfil',null]];
@@ -226,6 +404,7 @@ inicio(){
   return `<div class="stack">
   <div class="row between" style="height:52px">${logo(22)}<button class="ib" data-act="amigos" aria-label="Amigos">${ic('addp',24,1.6)}</button></div>
   ${installCard()}
+  ${AI.ready()?'':setupCard(true)}
   ${!has ? startCard() : `
    ${td ? `<button class="tap card row" data-open="${td.id}" style="border-radius:22px;gap:14px">${tile(td.id,'width:64px;height:76px;border-radius:14px;flex-shrink:0')}<span class="grow" style="line-height:1.3"><span class="xs muted" style="display:block">Hoy llevas</span><b style="font-size:17px;font-weight:600;display:block">${esc(P(td.id).name)}</b><span class="sm muted">${esc(P(td.id).brand)}</span></span><span class="muted">${ic('chev',16,2)}</span></button>`
      : `<button class="tap card row" data-act="logpick" style="border-radius:22px;gap:14px"><span style="width:52px;height:52px;border-radius:26px;background:var(--brand);color:#fff;display:flex;align-items:center;justify-content:center;flex-shrink:0">${ic('plus',22,2.2)}</span><span class="grow" style="line-height:1.3"><b style="font-size:17px;font-weight:600;display:block">¿Qué llevas hoy?</b><span class="sm muted">Apúntalo para tu resumen semanal</span></span></button>`}
@@ -245,10 +424,13 @@ descubrir(){
   const fams=[...new Set(all.map(p=>p.family))];
   return `<div class="stack">
    <h1 style="padding-top:10px">Buscar</h1>
-   <label class="field"><span class="muted">${ic('search',18,2)}</span><span class="sr">Buscar en tu colección</span><input id="q" type="search" placeholder="Nombre, marca o nota" value="${esc(Q)}" autocomplete="off" enterkeyhint="search"></label>
+   <form id="aform" class="row" style="gap:8px"><label class="field grow"><span class="muted">${ic('search',18,2)}</span><span class="sr">Buscar perfume</span><input id="q" type="search" placeholder="${AI.ready()?'Cualquier perfume, p. ej. Dior Sauvage':'Nombre, marca o nota'}" value="${esc(Q)}" autocomplete="off" enterkeyhint="search"></label>${AI.ready()?'<button class="btn primary" type="submit">Buscar</button>':''}</form>
+   ${LOOK.where==='search' ? (LOOK.state==='loading'?loading('Buscando «'+esc(LOOK.q)+'»…'):LOOK.state==='done'&&P(LOOK.id)?resultCard(LOOK.id,'Encontrado'):LOOK.state==='none'?notice('No encontramos ese perfume.','Revisa cómo se escribe o añade la marca.'):LOOK.state==='error'?notice('No se ha podido buscar.',esc(LOOK.err)):'') : ''}
+   ${AI.ready()?'':setupCard(true)}
+   ${all.length?`<h2 style="margin-top:4px">En tu colección</h2>`:''}
    ${fams.length>1?`<div class="hscroll">${fams.map(f=>`<button class="pill" data-famf="${esc(f)}" aria-pressed="${FAMF===f}">${esc(f)}</button>`).join('')}</div>`:''}
    ${all.length? (res.length?`<div class="list">${res.map(p=>{const c=mine(p.id); return `<button class="tap row" data-open="${p.id}" style="padding:10px 0">${tile(p.id,'width:50px;height:60px;border-radius:12px;flex-shrink:0')}<span class="grow" style="line-height:1.3"><b style="font-weight:600;display:block">${esc(p.name)}</b><span class="xs muted">${esc(p.brand)} · ${esc(p.family)}</span></span><span class="xs muted">${{tengo:'Tengo',deseo:'Deseo',agotados:'Agotado',muestras:'Muestra'}[c.shelf]}</span></button>`;}).join('')}</div>`
-     : notice('Nada con esa búsqueda.','Prueba con otra palabra o añádelo como perfume nuevo.')) : startCard()}
+     : `<p class="sm muted" style="margin:0">Nada de tu colección coincide.${AI.ready()?' Pulsa «Buscar» para buscarlo en todos los perfumes.':''}</p>`) : (AI.ready()?'':startCard())}
    <button class="btn block" data-act="new">${ic('plus',18,2)} Añadir un perfume</button>
    ${Q.trim().length>1?`<a class="btn block" href="https://www.fragrantica.es/search/?query=${encodeURIComponent(Q)}" target="_blank" rel="noopener">${ic('search',18,1.8)} Buscar «${esc(Q)}» en Fragrantica</a>`:''}
   </div>`;
@@ -260,15 +442,21 @@ escanear(){
   if(SCAN.url) view=`<img src="${SCAN.url}" alt="Tu foto" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover">`;
   else if(live) view=`<video id="camvideo" playsinline muted autoplay style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover"></video>
     <span style="position:absolute;inset:16% 14% 22%;border:2px solid rgba(255,255,255,.9);border-radius:28px;box-shadow:0 0 0 999px rgba(0,0,0,.28)" aria-hidden="true"></span>
-    <span class="sm" style="position:absolute;left:12px;right:12px;bottom:16px;text-align:center;color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.6)">${CAM.status==='starting'?'Abriendo la cámara…':(BARCODE?'Apunta al código de barras o haz una foto a la etiqueta':'Encuadra la etiqueta y pulsa el botón')}</span>
+    <span class="sm" style="position:absolute;left:12px;right:12px;bottom:16px;text-align:center;color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.6)">${CAM.status==='starting'?'Abriendo la cámara…':(BARCODE?'Apunta al código de barras o haz una foto al perfume':'Encuadra el perfume y pulsa el botón')}</span>
     ${CAM.torch?`<button class="ib" data-act="torch" aria-label="Linterna" aria-pressed="${CAM.torchOn}" style="position:absolute;top:10px;right:10px;background:${CAM.torchOn?'#fff':'rgba(0,0,0,.4)'};color:${CAM.torchOn?'#141414':'#fff'}">${ic('flash',20,1.8)}</button>`:''}`;
   else view=`<div style="display:flex;flex-direction:column;align-items:center;gap:10px;text-align:center;padding:24px;max-width:280px;color:#DDD">${ic('cam',36,1.6)}<span class="sm">${CAM.status==='error'?esc(CAM.err):'Haz una foto a la etiqueta o a la caja del perfume'}</span></div>`;
   let out='';
-  if(SCAN.state==='barcode') out=loading('Buscando el código '+esc(SCAN.code)+'…');
+  if(SCAN.state==='ai') out=loading('Identificando el perfume… puede tardar unos segundos.');
+  else if(SCAN.state==='airesult') out=resultCard(SCAN.id,'Identificado');
+  else if(SCAN.state==='aino') out=notice('No vemos ningún perfume en la foto.','Acércate al frasco o a la caja, con buena luz, y vuelve a probar.')+`<button class="btn block" data-act="manualfromphoto" style="margin-top:10px">Añadirlo a mano</button>`;
+  else if(SCAN.state==='aierror') out=notice('No se ha podido identificar.', esc(SCAN.err))+`<div class="row" style="gap:8px;margin-top:10px"><button class="btn primary grow" data-act="retryai">Reintentar</button><button class="btn grow" data-act="manualfromphoto">Añadir a mano</button></div>`;
+  else if(SCAN.state==='barcode') out=loading('Buscando el código '+esc(SCAN.code)+'…');
   else if(SCAN.state==='found'){ const p=P(SCAN.id); out=`<div class="card stack" style="gap:12px;border-radius:22px"><div class="row">${tile(p.id,'width:60px;height:72px;border-radius:14px;flex-shrink:0')}<span class="grow" style="line-height:1.3"><span class="xs" style="color:var(--good);font-weight:600">Está en tu colección</span><b style="font-size:18px;font-weight:600;display:block">${esc(p.name)}</b><span class="sm muted">${esc(p.brand)}</span></span></div><div class="row" style="gap:8px"><button class="btn primary grow" data-act="wearscan">${ic('check',18,2.2)} Hoy llevo este</button><button class="btn grow" data-open="${p.id}">Ver ficha</button></div></div>`; }
-  else if(SCAN.state==='notfound') out=notice('Código '+esc(SCAN.code)+' no encontrado.','No está en la base de datos abierta. Haz una foto a la etiqueta y lo añades tú.');
+  else if(SCAN.state==='notfound') out=notice('Código '+esc(SCAN.code)+' no encontrado.', AI.ready()?'Haz una foto al frasco y la IA lo identificará.':'No está en la base de datos abierta. Haz una foto a la etiqueta y lo añades tú.');
+  if(!AI.ready() && !SCAN.url && SCAN.state==='idle') out=setupCard(true);
   let controls;
-  if(SCAN.url || SCAN.state==='found' || SCAN.state==='notfound') controls = `<button class="btn primary block" data-act="rescan">${ic('scan',20,1.8)} Escanear otro</button>`;
+  if(SCAN.state==='ai') controls = `<button class="btn block" data-act="rescan">Cancelar</button>`;
+  else if(SCAN.url || ['found','notfound','airesult','aino','aierror'].includes(SCAN.state)) controls = `<button class="btn ${SCAN.state==='airesult'?'':'primary'} block" data-act="rescan">${ic('scan',20,1.8)} Escanear otro</button>`;
   else if(live) controls = `<div style="display:grid;grid-template-columns:1fr auto 1fr;align-items:center">
      <label for="gal" class="ib lbl" data-photo="scan" aria-label="Elegir de la galería" style="justify-self:start;width:48px;height:48px;border:1px solid var(--line)">${ic('img',22,1.7)}</label>
      <button data-act="shoot" aria-label="Hacer foto" ${CAM.status!=='live'?'disabled':''} style="width:74px;height:74px;border-radius:50%;border:4px solid var(--neroli);background:#fff;padding:5px"><span style="display:block;width:100%;height:100%;border-radius:50%;background:var(--neroli)"></span></button>
@@ -277,7 +465,7 @@ escanear(){
      <div class="row" style="gap:8px"><label for="cam" class="btn grow lbl ${CAM.status==='error'?'primary':''}" data-photo="scan">${ic('cam',20,1.8)} Hacer foto</label><label for="gal" class="btn grow lbl" data-photo="scan">${ic('img',20,1.7)} Galería</label></div>`;
   return `<div class="stack">
    <h1 style="padding-top:10px">Escanear</h1>
-   <div style="position:relative;height:min(58vh,460px);min-height:300px;border-radius:24px;background:#1B1A19;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#fff">${view}</div>
+   <div style="position:relative;height:${SCAN.url||SCAN.state!=='idle'?'200px':'min(58vh,460px)'};min-height:${SCAN.url||SCAN.state!=='idle'?'0':'300px'};border-radius:24px;background:#1B1A19;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#fff">${view}</div>
    ${controls}
    <div role="status" aria-live="polite">${out}</div>
   </div>`;
@@ -337,15 +525,17 @@ function shelfHTML(cs){
 
 /* ---------- ficha ---------- */
 function openFicha(id){
-  const p=P(id); if(!p) return; const c=mine(id);
+  const p=P(id); if(!p) return; const c=mine(id); const saved=!!S.items[id];
   const myRev=S.reviews[id];
   const shelfBtn=(k,l)=>`<button class="pill" data-set="${k}" aria-pressed="${c?.shelf===k}">${c?.shelf===k?'✓ ':''}${l}</button>`;
   const q=encodeURIComponent((p.brand?p.brand+' ':'')+p.name);
   const html=`<div class="wrap">
-   <div class="bar-top"><button class="ib" data-close aria-label="Volver">${ic('back',24,1.9)}</button><span class="row" style="gap:0"><button class="ib" data-act="edit" data-id="${id}" aria-label="Editar">${ic('edit',21,1.7)}</button><button class="ib" data-act="sharep" data-id="${id}" aria-label="Compartir">${ic('share',22,1.6)}</button></span></div>
+   <div class="bar-top"><button class="ib" data-close aria-label="Volver">${ic('back',24,1.9)}</button><span class="row" style="gap:0">${saved?`<button class="ib" data-act="edit" data-id="${id}" aria-label="Editar">${ic('edit',21,1.7)}</button>`:''}<button class="ib" data-act="sharep" data-id="${id}" aria-label="Compartir">${ic('share',22,1.6)}</button></span></div>
    <div style="display:flex;justify-content:center;align-items:center;height:${p.photo?340:280}px;margin-top:-44px;padding:${p.photo?'0':'40px 0 10px'};background:#F6F6F6">${p.photo?`<img src="${esc(p.photo)}" alt="" style="width:100%;height:100%;object-fit:cover;${c?.shelf==='agotados'?'filter:grayscale(1)':''}">`:bottleSVG(p.family,210,c?.shelf==='agotados')}</div>
    <div class="pad stack" style="padding-top:16px">
     <div style="line-height:1.25"><span class="cap">${esc(p.brand)}${p.year?' · '+p.year:''}</span><h1 style="font-size:28px;margin-top:4px">${esc(p.name)}</h1><span class="sm muted">${[p.conc,p.family,p.size].filter(Boolean).map(esc).join(' · ')}</span></div>
+    ${p.desc?`<p style="margin:0;font-size:15px;line-height:1.5">${esc(p.desc)}</p>`:''}
+    ${(p.gender||p.perfumer||(p.seasons&&p.seasons.length)||(p.occasions&&p.occasions.length))?`<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px">${[['Para',p.gender],['Perfumista',p.perfumer],['Estaciones',(p.seasons||[]).join(', ')],['Ocasiones',(p.occasions||[]).join(', ')]].filter(x=>x[1]).map(([k,v])=>`<span><span class="xs muted" style="display:block">${k}</span><b style="font-weight:600;font-size:14px">${esc(v)}</b></span>`).join('')}</div>`:''}
     <div class="hscroll" style="gap:8px">${shelfBtn('tengo','La tengo')}${shelfBtn('deseo','La quiero')}${shelfBtn('muestras','Muestra')}${c?.shelf==='tengo'?`<button class="pill" data-act="empty" data-id="${id}">Se me ha acabado</button>`:''}${c?.shelf==='agotados'?`<button class="pill" data-set="tengo">La he vuelto a comprar</button>`:''}</div>
     <button class="btn primary block" data-act="wear" data-id="${id}" ${c?.shelf==='agotados'||c?.shelf==='deseo'?'disabled':''}>${ic('check',18,2.2)} Hoy llevo este</button>
     ${c && (c.shelf==='tengo'||c.shelf==='muestras') ? `<div class="card stack" style="gap:12px">
@@ -355,15 +545,20 @@ function openFicha(id){
     ${(p.dur||p.estela)?`<div class="facts"><span><span class="xs muted" style="display:block">Familia</span><b style="font-weight:600;font-size:14px">${esc(p.family)}</b></span><span><span class="xs muted" style="display:block">Duración</span><b style="font-weight:600;font-size:14px">${esc(p.dur||'–')}</b></span><span><span class="xs muted" style="display:block">Estela</span><b style="font-weight:600;font-size:14px">${esc(p.estela||'–')}</b></span></div>`:''}
     ${p.notes.flat().length?`<section class="stack" style="gap:10px"><h2>Pirámide olfativa</h2>
      ${[['Salida','0–15 min',190],['Corazón','15 min–3 h',270],['Fondo','3 h en adelante',340]].map(([t,time,w],i)=>p.notes[i]&&p.notes[i].length?`<div class="tier" style="width:min(${w}px,100%)"><span class="xs muted"><b style="color:var(--ink);font-weight:600">${t}</b> · ${time}</span><div class="row" style="gap:4px;justify-content:center;flex-wrap:wrap">${p.notes[i].map(n=>`<div class="note">${noteImg(n,48)}${esc(n)}</div>`).join('')}</div></div>`:'').join('')}
-    </section>`:`<button class="btn block" data-act="edit" data-id="${id}">${ic('edit',18,1.7)} Añadir notas olfativas</button>`}
-    <section class="stack" style="gap:10px"><h2>Tu reseña</h2>
+    </section>`:''}
+    ${p.acc&&p.acc.length?`<section class="stack" style="gap:8px"><h2>Acordes principales</h2>${p.acc.map(([a,v])=>`<div class="row sm"><span style="width:104px;flex-shrink:0">${esc(a)}</span><div class="bar grow"><span style="width:${v}%;background:${famColor(p.family)}"></span></div></div>`).join('')}</section>`:''}
+    ${p.similar&&p.similar.length?`<section class="stack" style="gap:8px"><h2>Perfumes parecidos</h2><div class="row" style="flex-wrap:wrap;gap:6px">${p.similar.map(a=>`<button class="pill" data-alt="${esc((a.brand?a.brand+' ':'')+a.name)}">${esc((a.brand?a.brand+' ':'')+a.name)}</button>`).join('')}</div></section>`:''}
+    ${p.source==='ia'?'<p class="xs muted" style="margin:0">Información obtenida con IA a partir de fuentes públicas. Puede contener errores.</p>':''}
+    ${saved && !p.notes.flat().length ? (AI.ready()?`<button class="btn block" data-act="enrich" data-id="${id}">${ic('search',18,1.7)} Completar información con IA</button>`:`<button class="btn block" data-act="edit" data-id="${id}">${ic('edit',18,1.7)} Añadir notas olfativas</button>`) : ''}
+    ${saved && p.notes.flat().length && p.source!=='ia' && AI.ready() ? `<button class="btn block" data-act="enrich" data-id="${id}">${ic('search',18,1.7)} Completar información con IA</button>` : ''}
+    ${c?`<section class="stack" style="gap:10px"><h2>Tu reseña</h2>
      <label for="rev" class="sr">Escribe tu reseña</label><textarea id="rev" class="box" rows="3" placeholder="Duración, estela, para qué ocasión…">${esc(myRev||'')}</textarea>
-     <button class="btn" data-act="review" data-id="${id}">${myRev?'Guardar cambios':'Guardar reseña'}</button></section>
+     <button class="btn" data-act="review" data-id="${id}">${myRev?'Guardar cambios':'Guardar reseña'}</button></section>`:''}
     <section class="stack" style="gap:8px"><h2>Más información</h2>
      <a class="btn block" href="https://www.google.com/search?tbm=shop&q=${q}" target="_blank" rel="noopener">${ic('tag',18,1.8)} Comparar precios</a>
      <a class="btn block" href="https://www.fragrantica.es/search/?query=${q}" target="_blank" rel="noopener">${ic('search',18,1.8)} Ver en Fragrantica</a></section>
-    <section class="stack" style="gap:8px"><h2>Foto</h2><div class="row" style="gap:8px"><label for="cam" class="btn grow lbl" data-photo="${id}">${ic('cam',18,1.8)} Hacer foto</label><label for="gal" class="btn grow lbl" data-photo="${id}">${ic('img',18,1.7)} Galería</label></div>
-     <button class="btn block" data-act="remove" data-id="${id}" style="color:var(--warn);margin-top:12px">Borrar de Olfi</button></section>
+    ${saved?`<section class="stack" style="gap:8px"><h2>Foto</h2><div class="row" style="gap:8px"><label for="cam" class="btn grow lbl" data-photo="${id}">${ic('cam',18,1.8)} Hacer foto</label><label for="gal" class="btn grow lbl" data-photo="${id}">${ic('img',18,1.7)} Galería</label></div>
+     <button class="btn block" data-act="remove" data-id="${id}" style="color:var(--warn);margin-top:12px">Borrar de Olfi</button></section>`:''}
    </div></div>`;
   openLayer(html,'sheet',id);
 }
@@ -415,7 +610,7 @@ function saveForm(){
   readForm(); const f=FORM;
   if(!f.name){ toast('Escribe el nombre del perfume'); $('#f_name')?.focus(); return; }
   const id=f.id||newId();
-  const p={id, name:f.name, brand:f.brand, family:f.family||'Amaderado', conc:f.conc, year:Number(f.year)||null, size:f.size, dur:f.dur, estela:f.estela, notes:f.notes, photo:f.photo||null, barcode:f.barcode||P(id)?.barcode||null};
+  const p={...(S.items[id]||{}), id, name:f.name, brand:f.brand, family:f.family||'Amaderado', conc:f.conc, year:Number(f.year)||null, size:f.size, dur:f.dur, estela:f.estela, notes:f.notes, photo:f.photo||null, barcode:f.barcode||P(id)?.barcode||null};
   S.items[id]=p;
   if(!mine(id)) S.coll.push({id, shelf:f.shelf, score:null, level:f.shelf==='tengo'?100:null});
   save(); FORM=null; closeAll();
@@ -506,6 +701,7 @@ async function onBarcode(code){
     const j=await r.json(); if(j.status===1) prod=j.product;
   }catch(e){}
   if(!prod || !(prod.product_name_es||prod.product_name)){ SCAN={state:'notfound', code}; render(true); FORM_BARCODE=code; return; }
+  if(AI.ready()){ SCAN={state:'ai'}; lookupName([(prod.brands||'').split(',')[0], prod.product_name_es||prod.product_name].filter(Boolean).join(' '), 'scan'); return; }
   let photo=null;
   if(prod.image_front_url){ try{ const b=await (await fetch(prod.image_front_url)).blob(); photo=await toJpeg(b); }catch(e){} }
   SCAN={state:'idle'};
@@ -522,7 +718,7 @@ async function shoot(){
   o.getContext('2d').drawImage(v,sx,sy,sw,sh,0,0,o.width,o.height);
   navigator.vibrate?.(30); stopCam();
   const blob=await new Promise(r=>c.toBlob(r,'image/jpeg',.9)); const crop=await new Promise(r=>o.toBlob(r,'image/png'));
-  photoToForm(blob, crop);
+  if(AI.ready()) identifyPhoto(blob); else photoToForm(blob, crop);
 }
 async function photoToForm(blob, ocrSrc){
   const photo=await toJpeg(blob);
@@ -554,13 +750,13 @@ async function readText(src){
 
 /* ---------- acciones ---------- */
 function setShelf(id, shelf){
-  const c=mine(id); const lab={tengo:'«Tengo»',deseo:'«Deseo»',muestras:'«Muestras»'}[shelf];
+  ensureItem(id); const c=mine(id); const lab={tengo:'«Tengo»',deseo:'«Deseo»',muestras:'«Muestras»'}[shelf];
   if(c && c.shelf===shelf){ toast('Ya está en '+lab); return; }
   if(c){ c.shelf=shelf; if(shelf==='tengo'){ c.level=100; delete c.ended; } toast('Movido a '+lab); }
   else { S.coll.push({id,shelf,score:null,level:shelf==='tengo'?100:null}); toast('Añadido a '+lab); }
   save();
 }
-function logToday(id, occ){ const c=mine(id); if(!c) S.coll.push({id,shelf:'tengo',score:null,level:100}); S.logs=S.logs.filter(l=>l.date!==today()); S.logs.push({date:today(),id,occ:occ||null}); save(); toast('Apuntado: hoy llevas '+P(id).name); }
+function logToday(id, occ){ ensureItem(id); const c=mine(id); if(!c) S.coll.push({id,shelf:'tengo',score:null,level:100}); S.logs=S.logs.filter(l=>l.date!==today()); S.logs.push({date:today(),id,occ:occ||null}); save(); toast('Apuntado: hoy llevas '+P(id).name); }
 function removeItem(id){ S.coll=S.coll.filter(c=>c.id!==id); S.logs=S.logs.filter(l=>l.id!==id); delete S.reviews[id]; delete S.items[id]; save(); }
 
 document.addEventListener('click', e=>{
@@ -577,7 +773,16 @@ document.addEventListener('click', e=>{
   if(d.set){ setShelf(layerStack[layerStack.length-1].dataset.key, d.set); refreshTop(); return; }
   if(d.occ){ document.querySelectorAll('[data-occ]').forEach(b=>b.setAttribute('aria-pressed', String(b===t && b.getAttribute('aria-pressed')!=='true'))); return; }
   if(d.logid){ const occ=document.querySelector('[data-occ][aria-pressed="true"]')?.dataset.occ; logToday(d.logid, occ); closeAll(); render(true); return; }
+  if(d.prov){ const c=AI.get()||{}; AI.set({...c, provider:d.prov, model:null}); document.querySelectorAll('[data-prov]').forEach(b=>b.setAttribute('aria-pressed', String(b===t))); $('#provhelp').innerHTML=provHelp(d.prov); $('#aikey').placeholder=d.prov==='claude'?'sk-ant-…':'AIza…'; return; }
+  if(d.alt){ const q=d.alt; closeAll(); if(TAB==='escanear' && SCAN.state!=='idle'){ lookupName(q,'scan'); } else { TAB='descubrir'; Q=q; render(); lookupName(q,'search'); } return; }
   switch(d.act){
+    case 'aisetup': closeAll(); openAISetup(); break;
+    case 'aisave': { const k=$('#aikey').value.trim().replace(/\s+/g,''); if(!k){ toast('Pega la clave primero'); break; } const c=AI.get()||{provider:'gemini'}; AI.set({...c, provider:c.provider||'gemini', key:k}); testAI(); break; }
+    case 'aidel': { const c=AI.get()||{}; AI.set({provider:c.provider||'gemini', key:''}); closeAll(); render(true); toast('Clave quitada'); break; }
+    case 'keep': { const id=d.id; setShelf(id, d.to); if(TAB==='escanear') render(true); else render(true); break; }
+    case 'retryai': if(SCAN.blob) identifyPhoto(SCAN.blob); break;
+    case 'manualfromphoto': { const b=SCAN.blob; SCAN={state:'idle'}; if(b) photoToForm(b); else openForm({}); break; }
+    case 'enrich': enrich(d.id); break;
     case 'amigos': openAmigos(); break;
     case 'logpick': openPicker(); break;
     case 'new': closeAll(); openForm({barcode:FORM_BARCODE}); FORM_BARCODE=null; break;
@@ -585,7 +790,7 @@ document.addEventListener('click', e=>{
     case 'saveform': saveForm(); break;
     case 'shoot': shoot(); break;
     case 'torch': { const tr=CAM.stream?.getVideoTracks()[0]; CAM.torchOn=!CAM.torchOn; tr?.applyConstraints({advanced:[{torch:CAM.torchOn}]}).catch(()=>{}); t.setAttribute('aria-pressed',CAM.torchOn); t.style.background=CAM.torchOn?'#fff':'rgba(0,0,0,.4)'; t.style.color=CAM.torchOn?'#141414':'#fff'; break; }
-    case 'rescan': SCAN={state:'idle'}; render(true); break;
+    case 'rescan': SCAN.ctl?.abort(); LOOK.ctl?.abort(); SCAN={state:'idle'}; LOOK={state:'idle'}; render(true); break;
     case 'camon': CAM.status='idle'; startCam(); break;
     case 'wearscan': logToday(SCAN.id); SCAN={state:'idle'}; TAB='inicio'; render(); break;
     case 'wear': logToday(d.id); refreshTop(); break;
@@ -597,6 +802,7 @@ document.addEventListener('click', e=>{
     case 'invite': share(`Te invito a Olfi, una app para guardar tu colección de perfumes: ${location.origin+location.pathname}`); break;
     case 'install': installEvt?.prompt(); installEvt?.userChoice.finally(()=>{ installEvt=null; render(true); }); break;
     case 'ajustes': openLayer(`<div class="grab"></div><h2 style="margin-bottom:12px">Ajustes</h2><div class="stack" style="gap:10px"><label class="sm" for="nm">Nombre</label><input id="nm" class="field" style="padding:0 14px" value="${esc(S.name)}"><button class="btn primary" data-act="saveprofile">Guardar</button>
+      <h2 style="margin-top:10px">Reconocimiento de perfumes</h2><button class="btn" data-act="aisetup">${AI.ready()?'IA activada · cambiar clave':'Activar la IA'}</button>
       <h2 style="margin-top:10px">Copia de seguridad</h2><p class="sm muted" style="margin:0">Tus datos se guardan solo en este móvil. Descarga una copia de vez en cuando, o para pasarlos a otro móvil.</p>
       <button class="btn" data-act="export">${ic('down',18,1.8)} Descargar copia</button><label for="imp" class="btn lbl">Restaurar una copia</label>
       <button class="btn" data-act="wipe" style="color:var(--warn);margin-top:10px">Borrar todos mis datos</button></div>`,'modal','ajustes'); break;
@@ -608,6 +814,14 @@ document.addEventListener('click', e=>{
 });
 function share(text){ if(navigator.share) navigator.share({text}).catch(()=>{}); else navigator.clipboard?.writeText(text).then(()=>toast('Copiado'),()=>toast(text)); }
 document.addEventListener('click', e=>{ if(e.target.classList?.contains('modal')) closeLayer(); });
+document.addEventListener('submit', e=>{ if(e.target.id==='aform'){ e.preventDefault(); Q=$('#q').value.trim(); if(!AI.ready()) return; if(Q.length<2){ toast('Escribe el nombre del perfume'); return; } $('#q').blur(); lookupName(Q,'search'); } });
+async function enrich(id){
+  const p=S.items[id]; if(!p) return; toast('Buscando información…');
+  try{ const r=parseJSON(await aiAsk(promptName((p.brand?p.brand+' ':'')+p.name), null)); const n=fromAI(r); if(!n) throw new AIError('none','No se ha encontrado información.');
+    for(const k of ['acc','perfumer','gender','seasons','occasions','desc','similar','dur','estela','year','conc','family']) if(n[k] && (!Array.isArray(n[k])||n[k].length)) p[k]=n[k];
+    if(n.notes.flat().length) p.notes=n.notes; p.source='ia'; save(); toast('Información completada'); if(layerStack[layerStack.length-1]?.dataset.key===id) refreshTop();
+  }catch(e){ toast(aiErrText(e)); }
+}
 document.addEventListener('focusin', e=>{ if(e.target.id && e.target.id.startsWith('f_')) LASTFIELD=e.target.id; });
 document.addEventListener('input', e=>{
   const t=e.target;
@@ -618,7 +832,7 @@ document.addEventListener('input', e=>{
 function onFile(e){
   const f=e.target.files[0]; e.target.value=''; if(!f) return;
   const target=PHOTO_FOR||'scan'; PHOTO_FOR=null;
-  if(target==='scan'){ stopCam(); photoToForm(f); return; }
+  if(target==='scan'){ stopCam(); if(AI.ready()) identifyPhoto(f); else photoToForm(f); return; }
   if(target==='form'){ readFormSafe(); toJpeg(f).then(u=>{ if(FORM&&u){ FORM.photo=u; drawForm(); } }); return; }
   toJpeg(f).then(u=>{ if(u && S.items[target]){ S.items[target].photo=u; save(); toast('Foto guardada'); refreshTop(); } else toast('No se ha podido guardar la foto'); });
 }
